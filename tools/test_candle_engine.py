@@ -124,7 +124,7 @@ def run_engine(bars, tp_n=TP_N, sl_n=SL_N, max_open=10**9, restarts=()):
 
 
 def rebuild_counts(bars, entry_bar, is_buy, upto):
-    """RebuildCandleCounts aynasi: giris mumu HARIC, sonrasindaki kapanmis mumlar."""
+    """RebuildCandleCounts aynasi: giris mumu DAHIL, son kapanan muma kadar tum mumlar."""
     tp = sl = 0
     for k in range(entry_bar, upto):      # entry_bar .. upto-1 (upto-1 son kapanan mum)
         d = direction(*bars[k])
@@ -328,6 +328,42 @@ def t_max_open_cap():
     check(f"maksimum acik islem limiti ({MAX_OPEN}) asilmadi", peak <= MAX_OPEN, f"tepe={peak}")
 
 
+def t_deal_view():
+    """MT5 'Islemler (Deals)' gorunumu.
+
+    Her mumda en fazla 1 GIRIS deal'i olmali ve yonu mumun yonu olmali. Ayni anda gorunen
+    ters yonlu deal'ler eski pozisyonlarin KAPANIS emirleridir (BUY, SELL emriyle kapanir).
+    """
+    rng = random.Random(11)
+    bars, price = [], 1.1000
+    for _ in range(3000):
+        o = price
+        c = round(o + rng.gauss(0, 0.0006), 5)
+        bars.append((o, c))
+        price = c
+    table, _closed, events = run_engine(bars, max_open=MAX_OPEN)
+    side = {t["ticket"]: ("buy" if t["is_buy"] else "sell") for t in table}
+    ticks = {}                                   # k: (k+1). mumun ilk tick'i, yani mum k'nin kapanisi
+    for (k, kind, ticket, _x, _tp, _sl) in events:
+        d = ticks.setdefault(k, {"giris": [], "cikis": []})
+        if kind == "OPEN":
+            d["giris"].append(side[ticket])
+        else:                                    # kapanis emri pozisyonun TERSI yondedir
+            d["cikis"].append("sell" if side[ticket] == "buy" else "buy")
+    max_entries = max(len(d["giris"]) for d in ticks.values())
+    wrong_dir = sum(1 for k, d in ticks.items() for s in d["giris"]
+                    if (s == "buy") != (direction(*bars[k]) == 1))
+    both_sides = [k for k, d in ticks.items() if {"buy", "sell"} <= set(d["giris"] + d["cikis"])]
+    both_in_entries = [k for k, d in ticks.items() if {"buy", "sell"} <= set(d["giris"])]
+    check("deal gorunumu: her mumda en fazla 1 GIRIS, yonu = mumun yonu",
+          max_entries <= 1 and wrong_dir == 0, f"max giris/mum={max_entries} yanlis yon={wrong_dir}")
+    check("deal gorunumu: hicbir mumda ayni anda BUY ve SELL GIRISI yok",
+          not both_in_entries, f"{len(both_in_entries)} mum")
+    pct = 100.0 * len(both_sides) / len(ticks)
+    print(f"INFO  {len(ticks)} mum kapanisinin %{pct:.0f}'inde giris + TERS yonlu KAPANIS emri ayni anda "
+          f"gerceklesiyor -> grafikte/gecmiste 'hem buy hem sell' gibi gorunur (v10.1'de 'CIKIS ...' yorumlu)")
+
+
 def t_deterministic_walk():
     """Uzun rastgele yuruyus: motor ile oracle her islemde ayni olmali."""
     for seed in (1, 2, 3):
@@ -364,6 +400,7 @@ if __name__ == "__main__":
     t_entry_every_bar()
     t_restart_rebuild()
     t_max_open_cap()
+    t_deal_view()
     t_deterministic_walk()
     print()
     if failures:

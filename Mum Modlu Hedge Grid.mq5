@@ -1,18 +1,62 @@
 //+------------------------------------------------------------------+
 //|                                         Mum Modlu Hedge Grid.mq5 |
-//|         MUM KAPANISI YONUNDE ISLEM + MUM SAYACI TP/SL  (v10.00)  |
+//|         MUM KAPANISI YONUNDE ISLEM + MUM SAYACI TP/SL  (v10.10)  |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Algorithmic Hedge Strategy"
 #property link      "https://arena.ai"
-#property version   "10.00"
-#property description "GIRIS: Her mum kapanisinda calisir. Mum YUKARI kapandiysa BUY, ASAGI kapandiysa SELL acar (M1 ise her dakika)."
+#property version   "10.10"
+#property description "GIRIS: Her mum kapanisinda TEK islem. Mum YUKARI kapandiysa SADECE BUY, ASAGI kapandiysa SADECE SELL (M1 ise her dakika)."
 #property description "CIKIS: TP = giristen sonra 3 adet LEHINE mum kapanisi, SL = giristen sonra 10 adet ALEYHINE mum kapanisi."
 #property description "Mumlarin ARDISIK olmasi gerekmez; araya ters yonlu mumlar girebilir, sayac birikerek ilerler."
+#property description "Kapanis emirleri ters yonludur (BUY, SELL emriyle kapanir) ve 'CIKIS ...' yorumu tasir; yeni islem degildir."
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\AccountInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| KAPANIS EMRINE YORUM YAZAN CTrade                                |
+//| MT5'te BUY pozisyonu SELL yonlu bir emirle, SELL pozisyonu BUY   |
+//| yonlu bir emirle kapatilir. Standart CTrade::PositionClose bu    |
+//| emre yorum yazmadigi icin gecmiste ve grafikte her kapanis "yeni |
+//| ters islem" gibi gorunur. Bu metot CTrade::PositionClose ile     |
+//| BIREBIR ayni emri gonderir (ayni FillingCheck, fiyat, sapma),    |
+//| tek fark yorum alanini doldurmasidir: "CIKIS TP BUY #123".       |
+//+------------------------------------------------------------------+
+class CLabeledTrade : public CTrade
+{
+public:
+   bool PositionCloseLabeled(const ulong ticket, const string comment)
+   {
+      if(IsStopped(__FUNCTION__))
+         return(false);
+      if(!PositionSelectByTicket(ticket))
+         return(false);
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      ClearStructures();
+      if(!FillingCheck(symbol))
+         return(false);
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         m_request.type  = ORDER_TYPE_SELL;          // BUY pozisyonu kapatma emri
+         m_request.price = SymbolInfoDouble(symbol, SYMBOL_BID);
+      }
+      else
+      {
+         m_request.type  = ORDER_TYPE_BUY;           // SELL pozisyonu kapatma emri
+         m_request.price = SymbolInfoDouble(symbol, SYMBOL_ASK);
+      }
+      m_request.action    = TRADE_ACTION_DEAL;
+      m_request.position  = ticket;
+      m_request.symbol    = symbol;
+      m_request.volume    = PositionGetDouble(POSITION_VOLUME);
+      m_request.magic     = m_magic;
+      m_request.deviation = m_deviation;
+      m_request.comment   = comment;
+      return(OrderSend(m_request, m_result));
+   }
+};
 
 //+------------------------------------------------------------------+
 //| ENUMLAR VE SECENEKLER                                            |
@@ -67,13 +111,22 @@ input int      InpHudMaxRows          = 12;       // Panelde Listelenecek Maksim
 //+------------------------------------------------------------------+
 //| GLOBAL DEGISKENLER                                               |
 //+------------------------------------------------------------------+
-CTrade         trade;
+CLabeledTrade  trade;
 CPositionInfo  posInfo;
 CAccountInfo   accountInfo;
 
 double         pipValue = 0.0001;
 datetime       lastBarProcessed = 0;
 datetime       lastCandleProcessed = 0;   // Son islenen KAPALI mumun zamani
+datetime       lastEntrySignalBar  = 0;   // Giris yapilan son sinyal mumu (mum basina TEK giris korumasi)
+int            lastCandleDir       = 0;   // Son kapanan mumun yonu: 1 yukari, -1 asagi, 0 doji
+string         lastEntryInfo       = "-"; // Son mum kapanisinda ne yapildi (panel icin)
+
+// Bu sembolde bu EA'ya ait OLMAYAN pozisyonlar (baska EA / manuel / eski v9)
+int            foreignSameMagic    = 0;   // Ayni magic ama yabanci yorum (or. v9 PAIR_B_/PAIR_S_)
+int            foreignOtherMagic   = 0;   // Farkli magic veya manuel
+string         foreignSample       = "";
+int            lastForeignReported = -1;
 
 // Net Varlik (Equity) Takip Degiskenleri
 double         cycleStartEquity  = 0.0;
@@ -113,6 +166,63 @@ double NormalizeLot(double lot)
    if(lotStep <= 0) lotStep = 0.01;
    double normalized = MathFloor(lot / lotStep) * lotStep;
    return MathMax(minLot, MathMin(maxLot, normalized));
+}
+
+//+------------------------------------------------------------------+
+//| POZISYON SAHIPLIGI                                               |
+//| posInfo ile SECILI pozisyon bu EA'ya mi ait?                     |
+//| Ayni magic numarasini kullanan baska bir EA'nin (or. eski v9'un  |
+//| PAIR_B_/PAIR_S_ ciftleri) pozisyonlari sahiplenilmez/kapatilmaz. |
+//| Yorumu BOS olan pozisyon bizim sayilir: bazi brokerlar yorumu    |
+//| siler; aksi halde EA yeniden baslayinca kendi islemlerini sahip- |
+//| siz birakirdi.                                                   |
+//+------------------------------------------------------------------+
+bool IsOwnSelectedPosition()
+{
+   if(posInfo.Symbol() != _Symbol)               return false;
+   if(posInfo.Magic()  != (long)InpMagicNumber)  return false;
+   string c = posInfo.Comment();
+   if(c == "")                    return true;
+   if(StringFind(c, "GIRIS ") == 0) return true; // v10.10+ giris yorumu
+   if(StringFind(c, "CNDL_")  == 0) return true; // v10.00 giris yorumu
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| BU SEMBOLDE BU EA'YA AIT OLMAYAN POZISYONLARI SAY                |
+//| Grafikte gorunen her ok bu EA'dan gelmeyebilir: ayni sembolde    |
+//| calisan baska bir EA veya manuel islemler de cizilir.            |
+//+------------------------------------------------------------------+
+void ScanForeignPositions()
+{
+   foreignSameMagic  = 0;
+   foreignOtherMagic = 0;
+   foreignSample     = "";
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i))     continue;
+      if(posInfo.Symbol() != _Symbol)   continue;
+      if(IsOwnSelectedPosition())       continue;
+      if(posInfo.Magic() == (long)InpMagicNumber) foreignSameMagic++;
+      else                                        foreignOtherMagic++;
+      if(foreignSample == "")
+         foreignSample = StringFormat("%s magic=%I64d yorum='%s'",
+                                      (posInfo.PositionType() == POSITION_TYPE_BUY ? "BUY" : "SELL"),
+                                      posInfo.Magic(), posInfo.Comment());
+   }
+
+   int total = foreignSameMagic + foreignOtherMagic;
+   if(total != lastForeignReported)
+   {
+      if(total > 0)
+         PrintFormat("!! [UYARI]: %s uzerinde bu EA'ya AIT OLMAYAN %d pozisyon var (ayni magic: %d, farkli magic/manuel: %d). Ornek: %s. "
+                     "Bunlara dokunulmuyor; grafikteki BUY+SELL oklarinin bir kismi bunlardan geliyor olabilir. "
+                     "Ayni sembolde baska EA (or. eski v9) calisiyorsa kaldirin veya farkli magic verin.",
+                     _Symbol, total, foreignSameMagic, foreignOtherMagic, foreignSample);
+      else if(lastForeignReported > 0)
+         PrintFormat(">> [BILGI]: %s uzerinde artik bu EA disinda pozisyon yok.", _Symbol);
+      lastForeignReported = total;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -225,7 +335,7 @@ bool TryCloseByCandleCounts(int idx, datetime refBarTime)
    ulong  ticket = tradesTable[idx].ticket;
    string reason = tpHit ? "TP - LEHINE MUM SAYISI" : "SL - ALEYHINE MUM SAYISI";
 
-   if(!CloseTicket(ticket))
+   if(!CloseTicket(ticket, tradesTable[idx].isBuy, (tpHit ? "TP" : "SL")))
    {
       PrintFormat("!! [%s KAPATMA BASARISIZ]: #%I64u | Retcode: %d", reason, ticket, trade.ResultRetcode());
       return false;
@@ -262,8 +372,7 @@ void SyncTradesTable()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() != _Symbol)            continue;
-      if(posInfo.Magic()  != (long)InpMagicNumber) continue;
+      if(!IsOwnSelectedPosition())  continue;      // baska EA / manuel / eski v9 pozisyonlari sahiplenilmez
 
       ulong ticket = posInfo.Ticket();
       if(FindTradeIndex(ticket) >= 0) continue;
@@ -321,8 +430,19 @@ void SyncRealizedProfits()
 //+------------------------------------------------------------------+
 bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
 {
+   // MUM BASINA TEK GIRIS: ayni sinyal mumu icin ikinci kez (veya ters yonde) islem ACILMAZ.
+   // Isaret, emir gonderilmeden ONCE konur; emir basarisiz olsa bile ayni mumda tekrar denenmez.
+   if(signalBarTime <= lastEntrySignalBar)
+   {
+      PrintFormat("!! [KORUMA]: %s mumu icin giris zaten yapildi, ikinci islem acilmadi.",
+                  TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES));
+      return false;
+   }
+   lastEntrySignalBar = signalBarTime;
+
    if(CountActiveTrades() >= InpMaxOpenPositions)
    {
+      lastEntryInfo = StringFormat("%s -> limit dolu (%d), islem acilmadi", (isBuy ? "YUKARI" : "ASAGI"), InpMaxOpenPositions);
       Print(">> [UYARI]: Maksimum acik islem limitine ulasildi, yeni islem acilmadi.");
       return false;
    }
@@ -340,7 +460,8 @@ bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
       sl = isBuy ? (price - dist) : (price + dist);
    }
 
-   string cmt = StringFormat("CNDL_%s_%s", (isBuy ? "BUY" : "SELL"),
+   // Giris yorumu: "GIRIS BUY 2026.10.16 10:05" (sahiplik kontrolu bu oneki kullanir)
+   string cmt = StringFormat("GIRIS %s %s", (isBuy ? "BUY" : "SELL"),
                              TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES));
 
    double lot = NormalizeLot(InpBaseLot);
@@ -351,9 +472,12 @@ bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
 
    if(!ok)
    {
+      lastEntryInfo = StringFormat("%s -> %s ACILAMADI (retcode %d)", (isBuy ? "YUKARI" : "ASAGI"),
+                                   (isBuy ? "BUY" : "SELL"), trade.ResultRetcode());
       PrintFormat("!! [ISLEM ACILAMADI]: %s | Retcode: %d", (isBuy ? "BUY" : "SELL"), trade.ResultRetcode());
       return false;
    }
+   lastEntryInfo = StringFormat("%s -> SADECE %s acildi", (isBuy ? "YUKARI" : "ASAGI"), (isBuy ? "BUY" : "SELL"));
 
    // Pozisyon biletini dogru sekilde yakala (hedging/exchange execution farki icin)
    ulong orderTicket  = trade.ResultOrder();
@@ -380,21 +504,27 @@ bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
    // Sayac, giristen sonra kapanan ilk mumdan itibaren isler.
    AddTrackedTrade(positionId, isBuy, entryPrice, entryTime, signalBarTime, 0, 0);
    totalTradesOpened++;
+   lastEntryInfo = StringFormat("%s -> SADECE %s acildi #%I64u", (isBuy ? "YUKARI" : "ASAGI"),
+                                (isBuy ? "BUY" : "SELL"), positionId);
 
-   PrintFormat(">> [YENI ISLEM]: #%I64u %s | Giris: %.5f | Lot: %.2f | Mum: %s | TP hedefi: %d lehine mum, SL hedefi: %d aleyhine mum",
+   PrintFormat(">> [YENI ISLEM]: #%I64u %s (bu mumda acilan TEK islem) | Giris: %.5f | Lot: %.2f | Mum: %s %s | TP hedefi: %d lehine mum, SL hedefi: %d aleyhine mum",
                positionId, (isBuy ? "BUY" : "SELL"), entryPrice, lot,
-               TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES),
+               TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES), (isBuy ? "YUKARI" : "ASAGI"),
                InpTPCandleCount, InpSLCandleCount);
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| KAPALI POZISYONU PIYASADAN KAPAT                                 |
+//| POZISYONU PIYASADAN KAPAT (YORUMLU)                              |
+//| Kapanis emri pozisyonun TERSI yondedir (BUY -> SELL emri).       |
+//| Gecmiste "yeni islem" sanilmasin diye yorum yazilir:             |
+//|   "CIKIS TP BUY #123"  = 123 nolu BUY pozisyonu TP ile kapandi.  |
 //+------------------------------------------------------------------+
-bool CloseTicket(ulong ticket)
+bool CloseTicket(ulong ticket, bool isBuyPosition, string tag)
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
-   return trade.PositionClose(ticket);
+   string cmt = StringFormat("CIKIS %s %s #%I64u", tag, (isBuyPosition ? "BUY" : "SELL"), ticket);
+   return trade.PositionCloseLabeled(ticket, cmt);
 }
 
 //+------------------------------------------------------------------+
@@ -439,9 +569,11 @@ void ApplyClosedCandleToCounters(datetime closedBarTime, int dir)
 //| aradaki TUM kapanmis mumlar sirayla sayilir (sayac kaybi olmaz). |
 //| Yeni islem ise sadece EN SON kapanan mumun yonunde acilir.       |
 //+------------------------------------------------------------------+
-void ProcessClosedCandles()
+void ProcessClosedCandles(datetime prevBarTime)
 {
-   int prevShift = iBarShift(_Symbol, _Period, lastBarProcessed);
+   // prevBarTime = bir onceki tick'te ACIK olan (simdi kapanmis) mumun acilis zamani.
+   // Normalde shift 1'dedir (tek mum). Baglanti kopmasi vb. durumda aradaki tum mumlar islenir.
+   int prevShift = iBarShift(_Symbol, _Period, prevBarTime);
    if(prevShift < 1) prevShift = 1;
 
    MqlRates r[];
@@ -466,8 +598,10 @@ void ProcessClosedCandles()
       if(i == 0)
       {
          lastCandleProcessed = barTime;
+         lastCandleDir       = dir;
          if(dir == 0)
          {
+            lastEntryInfo = "DOJI -> islem acilmadi";
             PrintFormat(">> [MUM KAPANDI]: %s -> DOJI (acilis=kapanis), yon sinyali yok, yeni islem acilmadi.",
                         TimeToString(barTime, TIME_DATE | TIME_MINUTES));
          }
@@ -490,7 +624,7 @@ void CheckBasketTPAndProtection()
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
+      if(posInfo.SelectByIndex(i) && IsOwnSelectedPosition())
       {
          openCount++;
          totalBasketPnL += (posInfo.Profit() + posInfo.Swap() + posInfo.Commission());
@@ -523,7 +657,7 @@ void CheckBasketTPAndProtection()
 
    if(targetReached)
    {
-      CloseAllPositions();
+      CloseAllPositions("SEPET");
       ArrayResize(tradesTable, 0);
       totalBasketCloses++;
 
@@ -543,7 +677,7 @@ void CheckBasketTPAndProtection()
          double dd = ((balance - currentEquity) / balance) * 100.0;
          if(dd >= InpMaxDrawdownPercent)
          {
-            CloseAllPositions();
+            CloseAllPositions("DD");
             ArrayResize(tradesTable, 0);
             cycleStartEquity  = accountInfo.Equity();
             targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
@@ -554,12 +688,13 @@ void CheckBasketTPAndProtection()
    }
 }
 
-void CloseAllPositions()
+void CloseAllPositions(string tag)
 {
+   // Sadece bu EA'nin pozisyonlari kapatilir (ayni magic'li baska EA'larinkine dokunulmaz)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
-         trade.PositionClose(posInfo.Ticket());
+      if(posInfo.SelectByIndex(i) && IsOwnSelectedPosition())
+         CloseTicket(posInfo.Ticket(), (posInfo.PositionType() == POSITION_TYPE_BUY), tag);
    }
 }
 
@@ -573,7 +708,7 @@ void UpdateHUD()
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
+      if(posInfo.SelectByIndex(i) && IsOwnSelectedPosition())
       {
          if(posInfo.PositionType() == POSITION_TYPE_BUY) buyPositions++;
          else                                           sellPositions++;
@@ -587,14 +722,23 @@ void UpdateHUD()
 
    string tpModeStr = (InpBasketTPMode == BASKET_TP_EQUITY_GROWTH) ? "NET VARLIK (EQUITY) ARTISI" : "ANLIK YUZEN KAR (FLOATING)";
 
+   string dirStr = (lastCandleDir > 0) ? "YUKARI" : ((lastCandleDir < 0) ? "ASAGI" : "DOJI");
+   string lastCandleStr = (lastCandleProcessed > 0)
+                          ? StringFormat("%s %s | %s", TimeToString(lastCandleProcessed, TIME_DATE | TIME_MINUTES),
+                                         dirStr, lastEntryInfo)
+                          : "(EA baglandiktan sonra henuz mum kapanmadi)";
+
    string text = StringFormat(
       "==========================================================\n"
-      "   MUM MODLU HEDGE v10.0 - MUM SAYACI TP/SL (GRID YOK)    \n"
+      "   MUM MODLU HEDGE v10.1 - MUM SAYACI TP/SL (GRID YOK)    \n"
       "==========================================================\n"
-      "Giris Kurali : Her mum kapanisi -> YUKARI=BUY / ASAGI=SELL\n"
+      "Giris Kurali : Her mum kapanisinda TEK islem\n"
+      "               YUKARI mum -> SADECE BUY | ASAGI mum -> SADECE SELL\n"
       "TP Kurali    : Giris sonrasi %d adet LEHINE mum kapanisi\n"
       "SL Kurali    : Giris sonrasi %d adet ALEYHINE mum kapanisi\n"
       "Son Mum      : %s\n"
+      "Not          : Kapanis emri ters yonludur (BUY'i SELL emri kapatir)\n"
+      "               ve yorumu 'CIKIS ...' olur; yeni islem DEGILDIR.\n"
       "----------------------------------------------------------\n"
       "Acik Buy / Sell      : %d / %d  (Toplam: %d)\n"
       "Sepet Floating PnL   : %.2f USD\n"
@@ -610,7 +754,7 @@ void UpdateHUD()
       "==========================================================\n",
       InpTPCandleCount,
       InpSLCandleCount,
-      TimeToString(lastCandleProcessed, TIME_DATE | TIME_MINUTES),
+      lastCandleStr,
       buyPositions, sellPositions, buyPositions + sellPositions,
       floatingPnL,
       cycleStartEquity,
@@ -623,23 +767,34 @@ void UpdateHUD()
       totalRealizedProfitUSD
    );
 
+   if(foreignSameMagic + foreignOtherMagic > 0)
+      text += StringFormat("!! UYARI: Bu sembolde bu EA'ya AIT OLMAYAN %d pozisyon var (ayni magic: %d, diger: %d).\n"
+                           "!! Grafikteki oklarin bir kismi onlardan geliyor. Ornek: %s\n"
+                           "----------------------------------------------------------\n",
+                           foreignSameMagic + foreignOtherMagic, foreignSameMagic, foreignOtherMagic, foreignSample);
+
    // Acik islemlerin mum sayaclari (en yeni olanlar ustte)
    text += "ACIK ISLEMLERIN MUM SAYACLARI (TP: " + IntegerToString(InpTPCandleCount) +
            " lehine / SL: " + IntegerToString(InpSLCandleCount) + " aleyhine)\n";
 
-   int shown = 0;
+   // Comment() metni ~2045 karakterle sinirlidir; fazlasi sessizce kesilir.
+   // Bu yuzden satirlar sinira gore eklenir ve gosterilemeyenlerin sayisi yazilir.
+   int shown = 0, active = CountActiveTrades();
    for(int i = ArraySize(tradesTable) - 1; i >= 0 && shown < InpHudMaxRows; i--)
    {
       if(tradesTable[i].isClosed) continue;
-      text += StringFormat("#%I64u %s | Giris: %.5f | Lehine: %d/%d | Aleyhine: %d/%d\n",
-                           tradesTable[i].ticket,
-                           (tradesTable[i].isBuy ? "BUY " : "SELL"),
-                           tradesTable[i].entryPrice,
-                           tradesTable[i].tpCount, InpTPCandleCount,
-                           tradesTable[i].slCount, InpSLCandleCount);
+      string row = StringFormat("#%I64u %s | Giris: %.5f | Lehine: %d/%d | Aleyhine: %d/%d\n",
+                                tradesTable[i].ticket,
+                                (tradesTable[i].isBuy ? "BUY " : "SELL"),
+                                tradesTable[i].entryPrice,
+                                tradesTable[i].tpCount, InpTPCandleCount,
+                                tradesTable[i].slCount, InpSLCandleCount);
+      if(StringLen(text) + StringLen(row) > 1990) break;
+      text += row;
       shown++;
    }
-   if(shown == 0) text += "(su an acik islem yok)\n";
+   if(shown == 0 && active == 0) text += "(su an acik islem yok)\n";
+   else if(shown < active)       text += StringFormat("... (+%d acik islem daha)\n", active - shown);
 
    Comment(text);
 }
@@ -664,12 +819,19 @@ int OnInit()
    // Ilk tick'te yanlis sinyal uretmemek icin mevcut mumu islenmis say
    lastBarProcessed  = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
    lastCandleProcessed = 0;
+   lastEntrySignalBar  = 0;
+   lastCandleDir       = 0;
+   lastEntryInfo       = "-";
+   lastForeignReported = -1;
 
    cycleStartEquity  = accountInfo.Equity();
    targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
 
-   PrintFormat(">> [MUM MODLU HEDGE v10.0] Baslatildi | Sembol: %s | Periyot: %s | TP: %d lehine mum | SL: %d aleyhine mum | Baslangic Varlik: %.2f USD",
-               _Symbol, EnumToString(_Period), InpTPCandleCount, InpSLCandleCount, cycleStartEquity);
+   PrintFormat(">> [MUM MODLU HEDGE v10.1] Baslatildi | Sembol: %s | Periyot: %s | Magic: %I64u | Giris: her mumda TEK islem (YUKARI=BUY, ASAGI=SELL) | TP: %d lehine mum | SL: %d aleyhine mum | Baslangic Varlik: %.2f USD",
+               _Symbol, EnumToString(_Period), InpMagicNumber, InpTPCandleCount, InpSLCandleCount, cycleStartEquity);
+
+   // Ayni sembolde baska EA / eski surum pozisyonlari varsa hemen uyar
+   ScanForeignPositions();
    return INIT_SUCCEEDED;
 }
 
@@ -698,14 +860,20 @@ void OnTick()
       }
       else
       {
+         // ONCEKI mum zamanini sakla: kac mumun kapandigi buna gore hesaplanir.
+         // (v10.0'da lastBarProcessed once guncellendigi icin kacirilan mumlar hic sayilmiyordu.)
+         datetime prevBarTime = lastBarProcessed;
          lastBarProcessed = currentBarTime;
          SyncRealizedProfits();
-         ProcessClosedCandles();
+         ProcessClosedCandles(prevBarTime);
       }
    }
 
    // Sepet kar hedefi / drawdown korumasi
    CheckBasketTPAndProtection();
+
+   // Bu sembolde baska EA / manuel pozisyon var mi? (sadece degisince gunluge yazar)
+   ScanForeignPositions();
 
    if(InpShowHUD) UpdateHUD();
 }

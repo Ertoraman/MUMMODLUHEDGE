@@ -8,7 +8,7 @@ Script'ler iki şeyi kontrol eder:
 
 | Script | Ne yapar | Ne yapmaz |
 |---|---|---|
-| `lint_mq5.py` | `.mq5` üzerinde yapısal lint: parantez/küme/köşeli denge, kapanmamış string/yorum, dosyada tanımsız ve MQL5 built-in listesinde olmayan fonksiyon çağrıları (typo yakalama), **`CTrade` / `CPositionInfo` / `CAccountInfo` nesnelerinde var olmayan metot çağrıları** (ör. `posInfo.OpenTime()` → doğrusu `Time()`), `PrintFormat`/`StringFormat` format belirteci ↔ argüman sayısı uyumu | Tip kontrolü, MQL5 sözdizimi semantiği |
+| `lint_mq5.py` | `.mq5` üzerinde yapısal lint: parantez/küme/köşeli denge, kapanmamış string/yorum, dosyada tanımsız ve MQL5 built-in listesinde olmayan fonksiyon çağrıları (typo yakalama), **`CTrade` / `CPositionInfo` / `CAccountInfo` nesnelerinde var olmayan metot çağrıları** (ör. `posInfo.OpenTime()` → doğrusu `Time()`), bu sınıflardan türetilen sınıflar (ör. `CLabeledTrade : CTrade`) dahil; türetilen sınıfın gövdesinde taban sınıfın `protected` metotlarına izin verir, dışarıdan `protected` çağrıyı yakalar, `PrintFormat`/`StringFormat` format belirteci ↔ argüman sayısı uyumu | Tip kontrolü, MQL5 sözdizimi semantiği |
 | `test_candle_engine.py` | `.mq5` içindeki mum-sayacı motorunu (`ProcessClosedCandles` → `ApplyClosedCandleToCounters` → `TryCloseByCandleCounts`) aynı semantikle Python'a aktarır ve **bağımsız bir oracle** (işlem başı ileriye tarama) ile karşılaştırır. Eşikler (TP=3 / SL=10) sabit yazılmaz, `.mq5` içindeki input varsayılanlarından okunur | `.mq5` dosyasının kendisini çalıştırmaz |
 
 Çalıştırma:
@@ -35,6 +35,6 @@ python3 tools/lint_mq5.py --include-dir "C:/Users/<kullanici>/AppData/Roaming/Me
 Kapsanan davranışlar: girişin her mum kapanışında yön bazlı açılması, doji
 (açılış = kapanış) mumlarının ne giriş açması ne de sayaç ilerletmesi, TP'nin
 3. lehine mumda (ardışıklık aranmadan) ve SL'nin 10. aleyhine mumda tetiklenmesi,
-BUY/SELL simetrisi, EA yeniden başlatıldığında sayaçların geçmişten doğru
+BUY/SELL simetrisi, **her mumda en fazla 1 giriş ve hiçbir mumda aynı anda BUY+SELL girişi olmaması** (MT5 "İşlemler" görünümü simülasyonu), EA yeniden başlatıldığında sayaçların geçmişten doğru
 kurulması, `InpMaxOpenPositions` limiti ve uzun rastgele serilerde motor↔oracle
 eşitliği.

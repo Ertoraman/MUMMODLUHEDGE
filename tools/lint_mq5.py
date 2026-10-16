@@ -29,7 +29,7 @@ DEFAULT_EA = REPO / "Mum Modlu Hedge Grid.mq5"
 # Kaynak: MetaQuotes MQL5 Standard Library public metotlari
 #   Include/Object.mqh, Include/Trade/Trade.mqh, PositionInfo.mqh, AccountInfo.mqh
 # Iki farkli MT5 kurulum kopyasindan (telif satiri 2000-2024 ve 2000-2025)
-# public_methods() ile cikarildi; iki surumde liste birebir ayni.
+# class_methods() ile cikarildi; iki surumde listeler birebir ayni.
 STDLIB_METHODS = {
     "CObject": [
         "Compare", "Load", "Next", "Prev", "Save", "Type"
@@ -70,6 +70,18 @@ STDLIB_METHODS = {
     ],
 }
 
+# Ayni basliklarin PROTECTED metotlari: sadece bu siniflardan TURETILEN bir sinifin
+# govdesi icinden cagrilabilir (or. CLabeledTrade icinden FillingCheck()).
+STDLIB_PROTECTED = {
+    "CObject": [],
+    "CTrade": [
+        "ClearStructures", "ExpirationCheck", "FillingCheck", "IsHedging", "IsStopped",
+        "OrderTypeCheck", "SelectPosition"
+    ],
+    "CPositionInfo": [],
+    "CAccountInfo": [],
+}
+
 STDLIB_FILES = {
     "CObject": "Object.mqh",
     "CTrade": "Trade/Trade.mqh",
@@ -93,6 +105,7 @@ BUILTINS = {
     "TimeToString", "TimeCurrent", "StringToTime",
     # trade
     "PositionsTotal", "PositionGetTicket", "PositionSelectByTicket", "PositionGetDouble", "PositionGetInteger",
+    "PositionGetString",
     "HistorySelect", "HistoryDealsTotal", "HistoryDealGetTicket", "HistoryDealGetDouble",
     "HistoryDealGetInteger", "HistoryDealGetString", "HistoryDealSelect",
     "OrderGetTicket", "OrdersTotal",
@@ -113,8 +126,8 @@ def read_text(path):
     return raw.decode("utf-8-sig", errors="replace")
 
 
-def public_methods(text, cls):
-    """Bir .mqh icindeki 'class cls' bildiriminin public metot adlari."""
+def class_methods(text, cls, level="public"):
+    """Bir .mqh/.mq5 icindeki 'class cls' bildiriminin verilen erisim seviyesindeki metot adlari."""
     m = re.search(r"class\s+%s\b[^{]*\{(.*?)\n\s*\};" % re.escape(cls), text, re.S)
     if not m:
         raise ValueError(f"'{cls}' sinif bildirimi bulunamadi")
@@ -125,19 +138,19 @@ def public_methods(text, cls):
         prev = body
         body = re.sub(r"\{[^{}]*\}", ";", body)
     body = re.sub(r"\)\s*:\s*[^;]*", ");", body)          # kurucu ilklendirme listeleri
-    public, mode = [], "private"
+    picked, mode = [], "private"
     for stmt in body.split(";"):
         while True:
             a = re.search(r"\b(public|protected|private)\s*:", stmt)
             if not a:
                 break
-            if mode == "public":
-                public.append(stmt[:a.start()])
+            if mode == level:
+                picked.append(stmt[:a.start()])
             mode, stmt = a.group(1), stmt[a.end():]
-        if mode == "public":
-            public.append(stmt)
+        if mode == level:
+            picked.append(stmt)
     names = set()
-    for stmt in public:
+    for stmt in picked:
         n = re.search(r"\b([A-Za-z_]\w*)\s*\(", stmt)    # bildirimdeki ilk 'isim(' = metot adi
         if n:
             names.add(n.group(1))
@@ -145,14 +158,37 @@ def public_methods(text, cls):
 
 
 def load_methods(include_dir):
+    """-> (public, protected, kaynak). Her ikisi de {sinif: CObject dahil metot kumesi}."""
     if include_dir:
         base = Path(include_dir)
-        raw = {cls: public_methods(read_text(base / rel), cls) for cls, rel in STDLIB_FILES.items()}
+        texts = {cls: read_text(base / rel) for cls, rel in STDLIB_FILES.items()}
+        pub = {cls: class_methods(t, cls, "public") for cls, t in texts.items()}
+        prot = {cls: class_methods(t, cls, "protected") for cls, t in texts.items()}
         source = f"yerel kurulum: {base}"
     else:
-        raw = {cls: set(v) for cls, v in STDLIB_METHODS.items()}
+        pub = {cls: set(v) for cls, v in STDLIB_METHODS.items()}
+        prot = {cls: set(v) for cls, v in STDLIB_PROTECTED.items()}
         source = "gomulu liste (MQL5 std lib 2024/2025)"
-    return {cls: raw[cls] | raw["CObject"] for cls in STDLIB_CLASSES}, source
+    public = {cls: pub[cls] | pub["CObject"] for cls in STDLIB_CLASSES}
+    protected = {cls: prot[cls] | prot["CObject"] for cls in STDLIB_CLASSES}
+    return public, protected, source
+
+
+def find_derived_classes(mtext):
+    """Dosyada std-lib siniflarindan turetilen siniflar -> {ad: (taban, govde_bas, govde_son)}"""
+    out = {}
+    pat = r"\bclass\s+([A-Za-z_]\w*)\s*:\s*public\s+(%s)\s*\{" % "|".join(STDLIB_CLASSES)
+    for m in re.finditer(pat, mtext):
+        start, depth = m.end() - 1, 0
+        for j in range(start, len(mtext)):
+            if mtext[j] == "{":
+                depth += 1
+            elif mtext[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    out[m.group(1)] = (m.group(2), start, j)
+                    break
+    return out
 
 
 def mask_comments_and_strings(src):
@@ -243,7 +279,7 @@ def check_balance(mtext, unclosed, open_block):
     return errors
 
 
-def check_free_calls(mtext):
+def check_free_calls(mtext, derived, public, protected):
     defined = set(re.findall(r"^\s*(?:[A-Za-z_]\w*\s+)+([A-Za-z_]\w*)\s*\(", mtext, re.M))
     calls = {}
     for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", mtext):
@@ -256,16 +292,26 @@ def check_free_calls(mtext):
         if re.search(r"(?:void|int|bool|double|string|ulong|long|datetime|struct|enum|"
                      r"if|for|while|switch|return|else)$", pre):
             continue                          # tanim satirinin kendisi
+        # std-lib sinifindan turetilen bir sinifin GOVDESI icindeyse: taban sinifin
+        # public + protected metotlari da gecerlidir (or. FillingCheck, OrderSend)
+        base_ok = any(b0 <= m.start() <= b1 and name in (public[base] | protected[base])
+                      for base, b0, b1 in derived.values())
+        if base_ok:
+            continue
         calls.setdefault(name, line_of(mtext, m.start()))
     unknown = [f"satir {ln}: {name}()" for name, ln in sorted(calls.items(), key=lambda x: x[1])
                if name not in defined and name not in BUILTINS]
     return unknown, defined
 
 
-def check_member_calls(mtext, methods):
-    """CTrade/CPositionInfo/CAccountInfo nesnelerinde olmayan metot cagrilarini bulur."""
+def check_member_calls(mtext, public, protected, derived):
+    """std-lib nesnelerinde (ve onlardan turetilen siniflarda) olmayan metot cagrilarini bulur."""
+    allowed = dict(public)
+    for cls, (base, b0, b1) in derived.items():
+        own = class_methods(mtext, cls, "public")
+        allowed[cls] = public[base] | own
     obj_class = {}
-    decl = r"\b(%s)\s*[*&]?\s*([A-Za-z_]\w*)\s*[;=\[,)]" % "|".join(STDLIB_CLASSES)
+    decl = r"\b(%s)\s*[*&]?\s*([A-Za-z_]\w*)\s*[;=\[,)]" % "|".join(sorted(allowed, key=len, reverse=True))
     for m in re.finditer(decl, mtext):
         obj_class[m.group(2)] = m.group(1)
     issues, checked = [], 0
@@ -275,10 +321,15 @@ def check_member_calls(mtext, methods):
         if cls is None:
             continue
         checked += 1
-        if meth not in methods[cls]:
-            hint = difflib.get_close_matches(meth, sorted(methods[cls]), n=3, cutoff=0.5)
-            issues.append(f"satir {line_of(mtext, m.start())}: {obj}.{meth}() -> {cls} sinifinda "
-                          f"'{meth}' metodu yok" + (f" (benzerleri: {', '.join(hint)})" if hint else ""))
+        if meth not in allowed[cls]:
+            base = derived[cls][0] if cls in derived else cls
+            where = f"satir {line_of(mtext, m.start())}: {obj}.{meth}() -> "
+            if meth in protected[base]:
+                issues.append(where + f"{base}::{meth} PROTECTED; sinif disindan cagrilamaz")
+                continue
+            hint = difflib.get_close_matches(meth, sorted(allowed[cls]), n=3, cutoff=0.5)
+            issues.append(where + f"{cls} sinifinda '{meth}' metodu yok"
+                          + (f" (benzerleri: {', '.join(hint)})" if hint else ""))
     return issues, checked, obj_class
 
 
@@ -335,11 +386,12 @@ def main():
 
     src = read_text(args.file)
     mtext, unclosed, open_block = mask_comments_and_strings(src)
-    methods, method_source = load_methods(args.include_dir)
+    public, protected, method_source = load_methods(args.include_dir)
+    derived = find_derived_classes(mtext)
 
     balance = check_balance(mtext, unclosed, open_block)
-    unknown_calls, defined = check_free_calls(mtext)
-    member_issues, member_checked, objects = check_member_calls(mtext, methods)
+    unknown_calls, defined = check_free_calls(mtext, derived, public, protected)
+    member_issues, member_checked, objects = check_member_calls(mtext, public, protected, derived)
     fmt_issues = check_format_args(src)
     inputs = re.findall(r"^input\s+(?!group\b)[A-Za-z_][\w:]*\s+([A-Za-z_]\w*)", src, re.M)
 
@@ -355,6 +407,8 @@ def main():
         print("\n".join(items) if items else "OK")
     print(f"\nTanimli fonksiyon: {len(defined)} | input: {len(inputs)} | "
           f"std-lib nesneleri: {', '.join(f'{o}:{c}' for o, c in sorted(objects.items()))}")
+    if derived:
+        print("Turetilen siniflar: " + ", ".join(f"{c} : {b}" for c, (b, _, _) in derived.items()))
     print(f"Denetlenen std-lib metot cagrisi: {member_checked}  (kaynak: {method_source})")
     sys.exit(1 if any(items for _, items in sections) else 0)
 
