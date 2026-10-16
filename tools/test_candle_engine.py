@@ -13,12 +13,14 @@ varsayilanlarindan OKUNUR; boylece test dosyaya bagli kalir.
 import random
 import re
 import sys
+from pathlib import Path
 
-SRC = "Mum Modlu Hedge Grid.mq5"
+SRC = Path(__file__).resolve().parent.parent / "Mum Modlu Hedge Grid.mq5"
 
 
 def read_defaults():
-    txt = open(SRC, encoding="utf-8").read()
+    raw = SRC.read_bytes()                      # MetaEditor UTF-8 ya da UTF-16 kaydedebilir
+    txt = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig")
     tp = int(re.search(r"InpTPCandleCount\s*=\s*(\d+)", txt).group(1))
     sl = int(re.search(r"InpSLCandleCount\s*=\s*(\d+)", txt).group(1))
     mx = int(re.search(r"InpMaxOpenPositions\s*=\s*(\d+)", txt).group(1))

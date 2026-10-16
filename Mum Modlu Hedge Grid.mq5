@@ -269,7 +269,7 @@ void SyncTradesTable()
       if(FindTradeIndex(ticket) >= 0) continue;
 
       bool     isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
-      datetime oTime = posInfo.OpenTime();
+      datetime oTime = posInfo.Time();          // POSITION_TIME (acilis zamani)
       int      tp = 0, sl = 0;
       datetime lastBar = 0;
       RebuildCandleCounts(ticket, oTime, isBuy, tp, sl, lastBar);
@@ -373,7 +373,7 @@ bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
    if(posInfo.SelectByTicket(positionId))
    {
       entryPrice = posInfo.PriceOpen();
-      entryTime  = posInfo.OpenTime();
+      entryTime  = posInfo.Time();              // POSITION_TIME (acilis zamani)
    }
 
    // ONEMLI: Sinyali ureten (az once kapanan) mum SAYILMAZ.
