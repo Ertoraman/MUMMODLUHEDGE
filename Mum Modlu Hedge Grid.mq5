@@ -1,14 +1,13 @@
 //+------------------------------------------------------------------+
-//|                                        Hedge_Grid_Pro_EA.mq5     |
-//|               Copyright 2026, Institutional Hybrid Algorithmic EA|
-//|    KUSURSUZ ESLESMELI HEDGE GRID (PERPETUAL PAIRED HEDGE GRID)   |
-//|    + NET VARLIK (EQUITY) ARTISI ILE OTOMATIK SIFIRLAMA MODU      |
-//|    (100 USD Varlik -> 102 USD Oldugunda Sepeti Kapat ve Yeniden) |
+//|                                         Mum Modlu Hedge Grid.mq5 |
+//|         MUM KAPANISI YONUNDE ISLEM + MUM SAYACI TP/SL  (v10.00)  |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2026, Algorithmic Hedge Strategy"
 #property link      "https://arena.ai"
-#property version   "9.00"
-#property description "Her Kademe 1 Buy + 1 Sell Acar, Biri TP Olunca Digeri Sifirda Cikar, Net Varlik Hedefe Ulasinca Sepeti Sifirlar"
+#property version   "10.00"
+#property description "GIRIS: Her mum kapanisinda calisir. Mum YUKARI kapandiysa BUY, ASAGI kapandiysa SELL acar (M1 ise her dakika)."
+#property description "CIKIS: TP = giristen sonra 3 adet LEHINE mum kapanisi, SL = giristen sonra 10 adet ALEYHINE mum kapanisi."
+#property description "Mumlarin ARDISIK olmasi gerekmez; araya ters yonlu mumlar girebilir, sayac birikerek ilerler."
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -18,61 +17,52 @@
 //+------------------------------------------------------------------+
 //| ENUMLAR VE SECENEKLER                                            |
 //+------------------------------------------------------------------+
-enum ENUM_SPACING_MODE
-{
-   SPACING_MANUAL_PIPS,          // 1. Manuel Sabit Grid Araligi (Pips)
-   SPACING_AUTO_ATR,             // 2. Gecmis Mumlardan Otomatik (ATR Bazli)
-   SPACING_AUTO_CANDLE_RANGE     // 3. Gecmis Mumlardan Otomatik (High-Low Mum Boyu Ortalamasi)
-};
-
 enum ENUM_BASKET_TP_MODE
 {
-   BASKET_TP_EQUITY_GROWTH,      // 1. Net Varlik (Equity) Hedefi (Orn: 100 USD -> 102 USD) [ONERILEN]
+   BASKET_TP_EQUITY_GROWTH,      // 1. Net Varlik (Equity) Hedefi (Orn: 100 USD -> 102 USD)
    BASKET_TP_FLOATING_PNL        // 2. Acik Pozisyonlar Yuzen Kar (USD)
 };
 
 //+------------------------------------------------------------------+
-//| ESLESMELI HEDGE KADEME YAPISI                                    |
+//| MUM SAYACI ILE TAKIP EDILEN ISLEM KAYDI                          |
 //+------------------------------------------------------------------+
-struct SPairedLevel
+struct SCandleTrade
 {
-   ulong    buyTicket;           // O kademedeki Buy pozisyon bileti
-   ulong    sellTicket;          // O kademedeki Sell pozisyon bileti
-   double   levelPrice;          // Kademenin acildigi referans fiyat
-   bool     buyClosedTP;         // Buy TP oldu mu?
-   bool     sellClosedTP;        // Sell TP oldu mu?
-   bool     breakevenArmed;      // Diger bacak sifir noktasina (breakeven) kilitlendi mi?
-   bool     isCompleted;         // Bu ciftin iki bacagi da kapandi mi?
-   datetime openTime;
+   ulong    ticket;              // Pozisyon bileti
+   bool     isBuy;               // true = BUY, false = SELL
+   double   entryPrice;          // Giris fiyati
+   datetime entryTime;           // Giris zamani
+   datetime lastCountedBarTime;  // Sayaca islenen son KAPALI mumun acilis zamani
+   int      tpCount;             // Giris sonrasi LEHINE kapanan mum sayisi
+   int      slCount;             // Giris sonrasi ALEYHINE kapanan mum sayisi
+   bool     isClosed;            // Pozisyon kapandi mi?
 };
 
 //+------------------------------------------------------------------+
 //| INPUT PARAMETRELERI                                              |
 //+------------------------------------------------------------------+
-input group "=== 1. ESLESMELI HEDGE GRID TEMEL AYARLARI ==="
-input ulong    InpMagicNumber        = 654321;          // Bot Magic Numarasi
-input double   InpBaseLot            = 0.01;            // Baslangic Lot Boyutu
-input int      InpMaxOpenPairs       = 10;              // Maksimum Ayni Anda Takip Edilecek Cift Sayisi
-input int      InpSlippagePoints     = 15;              // Maksimum Kayma Toleransi (Puan)
+input group "=== 1. ISLEM VE LOT AYARLARI ==="
+input ulong    InpMagicNumber         = 654321;   // Bot Magic Numarasi
+input double   InpBaseLot             = 0.01;     // Islem Lot Boyutu
+input int      InpSlippagePoints      = 15;       // Maksimum Kayma Toleransi (Puan)
+input int      InpMaxOpenPositions    = 25;       // Ayni Anda Acik Tutulacak Maksimum Islem Sayisi
 
-input group "=== 2. GRID ARALIGI HESAPLAMA MODU ==="
-input ENUM_SPACING_MODE InpSpacingMode = SPACING_MANUAL_PIPS; // Grid Araligi Belirleme Yontemi
-input double   InpManualGridPips     = 5.0;             // [Manuel Mod] Sabit Grid Araligi (Pips)
-input int      InpLookbackBars       = 24;              // [Otomatik Mod] Gecmis Mum Tarama Sayisi (Bar)
-input double   InpAutoMultiplier     = 1.0;             // [Otomatik Mod] Hesaplanan Mum Araligi Carpani
-input int      InpATRPeriod          = 14;              // [ATR Modu] ATR Periyodu
+input group "=== 2. MUM SAYACI TP / SL AYARLARI ==="
+input int      InpTPCandleCount       = 3;        // TP: Giris sonrasi kac adet LEHINE mum kapanisi (0 = TP kapali)
+input int      InpSLCandleCount       = 10;       // SL: Giris sonrasi kac adet ALEYHINE mum kapanisi (0 = SL kapali)
+input bool     InpUseSafetyPriceStop  = false;    // Ek Emniyet Fiyat Stopu (baglanti kopmasina karsi sigorta)
+input double   InpSafetyStopPips      = 300.0;    // [Emniyet Stop] Mesafe (Pips)
 
-input group "=== 3. SIFIR NOKTASI (BREAKEVEN) VE EMNIYET KORUMASI ==="
-input double   InpBreakevenBufferPips= 0.5;             // Basa Bas Cikista Spread Toleransi (Pips)
-input bool     InpUseSafetySL        = true;            // Tek Yonlu Kacista Emniyet Stopu (SL)
-input double   InpSafetySLMultiplier = 4.0;             // Emniyet Stop Carpani (Grid Adimi x Bu Carpan)
+input group "=== 3. SEPET VE NET VARLIK (EQUITY) KAR YONETIMI ==="
+input bool                 InpUseBasketTP        = true;                    // Sepet Toplam Kar Kapanisi Aktif
+input ENUM_BASKET_TP_MODE  InpBasketTPMode       = BASKET_TP_EQUITY_GROWTH; // Kar Hesaplama Modu
+input double               InpTargetProfitUSD    = 2.0;                     // Hedef Kar Miktari (USD)
+input bool                 InpUseEquityProtection= true;                    // Maksimum Zarar Kes Korumasi
+input double               InpMaxDrawdownPercent = 20.0;                    // Maksimum Izin Verilen Hesap Drawdown (%)
 
-input group "=== 4. SEPET VE NET VARLIK (EQUITY) KAR YONETIMI ==="
-input bool                 InpUseBasketTP        = true;                      // Sepet Toplam Kar Kapanisi Aktif
-input ENUM_BASKET_TP_MODE  InpBasketTPMode       = BASKET_TP_EQUITY_GROWTH;   // Kar Hesaplama Modu (Varlik Bazli)
-input double               InpTargetProfitUSD    = 2.0;                       // Hedef Kar Miktari (USD)
-input bool                 InpUseEquityProtection= true;                      // Maksimum Zarar Kes Korumasi
-input double               InpMaxDrawdownPercent = 20.0;                      // Maksimum Izin Verilen Hesap Drawdown (%)
+input group "=== 4. GORSEL ==="
+input bool     InpShowHUD             = true;     // Ekranda Bilgi Paneli Goster
+input int      InpHudMaxRows          = 12;       // Panelde Listelenecek Maksimum Acik Islem Satiri
 
 //+------------------------------------------------------------------+
 //| GLOBAL DEGISKENLER                                               |
@@ -81,28 +71,24 @@ CTrade         trade;
 CPositionInfo  posInfo;
 CAccountInfo   accountInfo;
 
-int            atrHandle = INVALID_HANDLE;
 double         pipValue = 0.0001;
-int            pipsToDigits = 4;
-
-double         currentEffectiveStepPips = 5.0;
-double         currentEffectiveStepPrice = 0.00050;
 datetime       lastBarProcessed = 0;
+datetime       lastCandleProcessed = 0;   // Son islenen KAPALI mumun zamani
 
-// Net Varlık (Equity) Takip Değişkenleri
-double         cycleStartEquity = 0.0;
+// Net Varlik (Equity) Takip Degiskenleri
+double         cycleStartEquity  = 0.0;
 double         targetCycleEquity = 0.0;
 
-// Eslesmeli Kademe Tablosu
-SPairedLevel   pairsTable[];
+// Mum sayaci ile takip edilen islemler
+SCandleTrade   tradesTable[];
 
 // Istatistikler
 double         totalRealizedProfitUSD = 0.0;
-int            totalPairsCreated = 0;
-int            totalTPHits = 0;
-int            totalBreakevenCloses = 0;
-int            totalClosedCycles = 0;
-datetime       lastHistoryCheck = 0;
+int            totalTradesOpened = 0;
+int            totalTPCloses     = 0;
+int            totalSLCloses     = 0;
+int            totalBasketCloses = 0;
+datetime       lastHistoryCheck  = 0;
 
 //+------------------------------------------------------------------+
 //| YARDIMCI PIP VE LOT FONKSIYONLARI                                |
@@ -111,19 +97,13 @@ void InitPipFactor()
 {
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    if(digits == 3 || digits == 5)
-   {
       pipValue = 10.0 * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      pipsToDigits = digits - 1;
-   }
    else
-   {
       pipValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      pipsToDigits = digits;
-   }
+   if(pipValue <= 0) pipValue = 0.0001;
 }
 
 double PipsToPrice(double pips) { return pips * pipValue; }
-double PriceToPips(double priceDiff) { return (pipValue > 0) ? MathAbs(priceDiff) / pipValue : 0; }
 
 double NormalizeLot(double lot)
 {
@@ -136,55 +116,173 @@ double NormalizeLot(double lot)
 }
 
 //+------------------------------------------------------------------+
-//| GRID ARALIGI HESAPLAMA MOTORU (MANUEL & GECMIS MUMLARDAN OTO)   |
+//| BIR POZISYONUN GECMIS MUM SAYACLARINI YENIDEN KUR (RESTART/GAP)  |
+//| GIRIS MUMU DAHIL, o andaki son KAPALI muma kadar tum mumlar      |
+//| sayilir. Boylece EA yeniden baslasa bile sayac dogru devam eder. |
 //+------------------------------------------------------------------+
-void UpdateGridSpacing()
+void RebuildCandleCounts(ulong ticket, datetime openTime, bool isBuy,
+                         int &tpCount, int &slCount, datetime &lastCountedBar)
 {
-   if(InpSpacingMode == SPACING_MANUAL_PIPS)
+   tpCount = 0;
+   slCount = 0;
+   lastCountedBar = 0;
+
+   int entryShift = iBarShift(_Symbol, _Period, openTime);
+   if(entryShift < 0) entryShift = 0;
+
+   // Giris mumunun acilis zamani = "son sayilan mum" baslangic noktasi
+   datetime entryBarTime = iTime(_Symbol, _Period, entryShift);
+   if(entryBarTime > 0) lastCountedBar = entryBarTime;
+
+   // Sayilan mumlar: GIRIS MUMU DAHIL, o andaki son KAPALI muma kadar.
+   // (Islem, giris mumunun basindan itibaren acik oldugu icin giris mumu da sayilir.
+   //  Canli akista da boyledir: islem yeni mumun acilisinda acilir, o mum sayilir.)
+   int barsToScan = entryShift;
+   if(barsToScan < 1) return;
+
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int copied = CopyRates(_Symbol, _Period, 1, barsToScan, r);
+   if(copied < 1) return;
+
+   for(int i = 0; i < copied; i++)
    {
-      currentEffectiveStepPips = InpManualGridPips;
-      currentEffectiveStepPrice = PipsToPrice(currentEffectiveStepPips);
-      return;
+      int dir = 0;
+      if(r[i].close > r[i].open)      dir =  1;
+      else if(r[i].close < r[i].open) dir = -1;
+      if(dir == 0) continue;                       // Doji sayilmaz
+
+      bool inFavor = (isBuy && dir ==  1) || (!isBuy && dir == -1);
+      if(inFavor) tpCount++;
+      else        slCount++;
    }
-   
-   if(InpSpacingMode == SPACING_AUTO_ATR)
+}
+
+//+------------------------------------------------------------------+
+//| TABLO YARDIMCILARI                                               |
+//+------------------------------------------------------------------+
+int FindTradeIndex(ulong ticket)
+{
+   for(int i = 0; i < ArraySize(tradesTable); i++)
+      if(tradesTable[i].ticket == ticket) return i;
+   return -1;
+}
+
+int AddTrackedTrade(ulong ticket, bool isBuy, double entryPrice, datetime entryTime,
+                    datetime lastCountedBar, int tpCount, int slCount)
+{
+   int sz = ArraySize(tradesTable);
+   ArrayResize(tradesTable, sz + 1);
+   tradesTable[sz].ticket             = ticket;
+   tradesTable[sz].isBuy              = isBuy;
+   tradesTable[sz].entryPrice         = entryPrice;
+   tradesTable[sz].entryTime          = entryTime;
+   tradesTable[sz].lastCountedBarTime = lastCountedBar;
+   tradesTable[sz].tpCount            = tpCount;
+   tradesTable[sz].slCount            = slCount;
+   tradesTable[sz].isClosed           = false;
+   return sz;
+}
+
+void CompactTradesTable()
+{
+   if(ArraySize(tradesTable) < 300) return;
+   SCandleTrade alive[];
+   for(int i = 0; i < ArraySize(tradesTable); i++)
    {
-      if(atrHandle != INVALID_HANDLE)
-      {
-         double b[1];
-         if(CopyBuffer(atrHandle, 0, 0, 1, b) > 0 && b[0] > 0)
-         {
-            double atrPrice = b[0] * InpAutoMultiplier;
-            currentEffectiveStepPips = PriceToPips(atrPrice);
-            if(currentEffectiveStepPips < 3.0) currentEffectiveStepPips = 3.0;
-            currentEffectiveStepPrice = PipsToPrice(currentEffectiveStepPips);
-            return;
-         }
-      }
+      if(tradesTable[i].isClosed) continue;
+      int sz = ArraySize(alive);
+      ArrayResize(alive, sz + 1);
+      alive[sz] = tradesTable[i];
    }
-   
-   if(InpSpacingMode == SPACING_AUTO_CANDLE_RANGE)
+   ArrayResize(tradesTable, ArraySize(alive));
+   for(int i = 0; i < ArraySize(alive); i++) tradesTable[i] = alive[i];
+}
+
+int CountActiveTrades()
+{
+   int n = 0;
+   for(int i = 0; i < ArraySize(tradesTable); i++)
+      if(!tradesTable[i].isClosed) n++;
+   return n;
+}
+
+//+------------------------------------------------------------------+
+//| SAYACLARA GORE TP/SL KONTROLU VE KAPATMA                         |
+//| Hem her mum kapanisinda hem de tabloya yeni alinan (restart)     |
+//| islemlerde kullanilir; boylece esik gecmiste asildiysa bile      |
+//| islem bir mum beklemeden hemen kapatilir.                        |
+//+------------------------------------------------------------------+
+bool TryCloseByCandleCounts(int idx, datetime refBarTime)
+{
+   if(idx < 0 || idx >= ArraySize(tradesTable)) return false;
+   if(tradesTable[idx].isClosed) return false;
+
+   bool tpHit = (InpTPCandleCount > 0 && tradesTable[idx].tpCount >= InpTPCandleCount);
+   bool slHit = (InpSLCandleCount > 0 && tradesTable[idx].slCount >= InpSLCandleCount);
+   if(!tpHit && !slHit) return false;
+
+   ulong  ticket = tradesTable[idx].ticket;
+   string reason = tpHit ? "TP - LEHINE MUM SAYISI" : "SL - ALEYHINE MUM SAYISI";
+
+   if(!CloseTicket(ticket))
    {
-      MqlRates rates[];
-      ArraySetAsSeries(rates, true);
-      int copied = CopyRates(_Symbol, _Period, 1, InpLookbackBars, rates);
-      if(copied > 0)
-      {
-         double sumRangePrice = 0.0;
-         for(int i = 0; i < copied; i++)
-         {
-            sumRangePrice += (rates[i].high - rates[i].low);
-         }
-         double avgCandleRange = (sumRangePrice / copied) * InpAutoMultiplier;
-         currentEffectiveStepPips = PriceToPips(avgCandleRange);
-         if(currentEffectiveStepPips < 3.0) currentEffectiveStepPips = 3.0;
-         currentEffectiveStepPrice = PipsToPrice(currentEffectiveStepPips);
-         return;
-      }
+      PrintFormat("!! [%s KAPATMA BASARISIZ]: #%I64u | Retcode: %d", reason, ticket, trade.ResultRetcode());
+      return false;
    }
-   
-   currentEffectiveStepPips = InpManualGridPips;
-   currentEffectiveStepPrice = PipsToPrice(currentEffectiveStepPips);
+
+   tradesTable[idx].isClosed = true;
+   if(tpHit) totalTPCloses++;
+   else      totalSLCloses++;
+
+   PrintFormat(">>>>> [%s]: #%I64u %s kapatildi | Giris: %.5f | Lehine mum: %d/%d | Aleyhine mum: %d/%d | Referans mum: %s",
+               reason, ticket, (tradesTable[idx].isBuy ? "BUY" : "SELL"),
+               tradesTable[idx].entryPrice,
+               tradesTable[idx].tpCount, InpTPCandleCount,
+               tradesTable[idx].slCount, InpSLCandleCount,
+               TimeToString(refBarTime, TIME_DATE | TIME_MINUTES));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ACIK POZISYONLAR ILE TABLOYU SENKRONIZE ET                       |
+//| (EA yeniden baslayinca veya pozisyon disaridan kapaninca)        |
+//+------------------------------------------------------------------+
+void SyncTradesTable()
+{
+   // 1) Tabloda olup artik acik olmayanlari "kapandi" isaretle
+   for(int i = 0; i < ArraySize(tradesTable); i++)
+   {
+      if(tradesTable[i].isClosed) continue;
+      if(!posInfo.SelectByTicket(tradesTable[i].ticket))
+         tradesTable[i].isClosed = true;
+   }
+
+   // 2) Acik olup tabloda olmayanlari ekle ve sayaclari gecmisten kur
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol)            continue;
+      if(posInfo.Magic()  != (long)InpMagicNumber) continue;
+
+      ulong ticket = posInfo.Ticket();
+      if(FindTradeIndex(ticket) >= 0) continue;
+
+      bool     isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      datetime oTime = posInfo.OpenTime();
+      int      tp = 0, sl = 0;
+      datetime lastBar = 0;
+      RebuildCandleCounts(ticket, oTime, isBuy, tp, sl, lastBar);
+
+      int idx = AddTrackedTrade(ticket, isBuy, posInfo.PriceOpen(), oTime, lastBar, tp, sl);
+      PrintFormat(">> [TABLOYA ALINDI]: #%I64u %s | Giris: %.5f | Gecmisten sayac -> Lehine:%d / Aleyhine:%d",
+                  ticket, (isBuy ? "BUY" : "SELL"), posInfo.PriceOpen(), tp, sl);
+
+      // Esik gecmiste zaten asildiysa bir mum beklemeden hemen kapat
+      TryCloseByCandleCounts(idx, lastBar);
+   }
+
+   CompactTradesTable();
 }
 
 //+------------------------------------------------------------------+
@@ -194,9 +292,9 @@ void SyncRealizedProfits()
 {
    datetime from = (lastHistoryCheck == 0) ? (TimeCurrent() - 86400 * 3) : lastHistoryCheck;
    datetime to   = TimeCurrent();
-   
+
    if(!HistorySelect(from, to)) return;
-   
+
    int totalDeals = HistoryDealsTotal();
    for(int i = 0; i < totalDeals; i++)
    {
@@ -208,10 +306,9 @@ void SyncRealizedProfits()
             datetime dt = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
             if(dt > lastHistoryCheck)
             {
-               double pnl = HistoryDealGetDouble(t, DEAL_PROFIT) + 
-                            HistoryDealGetDouble(t, DEAL_SWAP) + 
-                            HistoryDealGetDouble(t, DEAL_COMMISSION);
-               totalRealizedProfitUSD += pnl;
+               totalRealizedProfitUSD += HistoryDealGetDouble(t, DEAL_PROFIT) +
+                                         HistoryDealGetDouble(t, DEAL_SWAP) +
+                                         HistoryDealGetDouble(t, DEAL_COMMISSION);
             }
          }
       }
@@ -220,191 +317,166 @@ void SyncRealizedProfits()
 }
 
 //+------------------------------------------------------------------+
-//| HER SEVIYEDE EKSIKSIZ 1 BUY + 1 SELL ACAN CEKIRDEK FONKSIYON     |
+//| YENI POZISYON AC (MUM YONUNE GORE)                               |
 //+------------------------------------------------------------------+
-bool OpenPairedLevel(double ask, double bid, double levelPrice)
+bool OpenCandleTrade(bool isBuy, datetime signalBarTime)
+{
+   if(CountActiveTrades() >= InpMaxOpenPositions)
+   {
+      Print(">> [UYARI]: Maksimum acik islem limitine ulasildi, yeni islem acilmadi.");
+      return false;
+   }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(price <= 0) return false;
+
+   double sl = 0.0;
+   if(InpUseSafetyPriceStop && InpSafetyStopPips > 0)
+   {
+      double dist = PipsToPrice(InpSafetyStopPips);
+      sl = isBuy ? (price - dist) : (price + dist);
+   }
+
+   string cmt = StringFormat("CNDL_%s_%s", (isBuy ? "BUY" : "SELL"),
+                             TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES));
+
+   double lot = NormalizeLot(InpBaseLot);
+
+   bool ok;
+   if(isBuy) ok = trade.Buy (lot, _Symbol, price, sl, 0.0, cmt);
+   else      ok = trade.Sell(lot, _Symbol, price, sl, 0.0, cmt);
+
+   if(!ok)
+   {
+      PrintFormat("!! [ISLEM ACILAMADI]: %s | Retcode: %d", (isBuy ? "BUY" : "SELL"), trade.ResultRetcode());
+      return false;
+   }
+
+   // Pozisyon biletini dogru sekilde yakala (hedging/exchange execution farki icin)
+   ulong orderTicket  = trade.ResultOrder();
+   ulong dealTicket   = trade.ResultDeal();
+   ulong positionId   = 0;
+   if(dealTicket > 0 && HistoryDealSelect(dealTicket))
+      positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+   if(positionId == 0) positionId = orderTicket;
+   if(positionId == 0)
+   {
+      Print("!! [UYARI]: Islem acildi ama pozisyon bileti okunamadi, tablo bir sonraki tick'te senkronlanacak.");
+      return false;
+   }
+
+   double entryPrice = price;
+   datetime entryTime = TimeCurrent();
+   if(posInfo.SelectByTicket(positionId))
+   {
+      entryPrice = posInfo.PriceOpen();
+      entryTime  = posInfo.OpenTime();
+   }
+
+   // ONEMLI: Sinyali ureten (az once kapanan) mum SAYILMAZ.
+   // Sayac, giristen sonra kapanan ilk mumdan itibaren isler.
+   AddTrackedTrade(positionId, isBuy, entryPrice, entryTime, signalBarTime, 0, 0);
+   totalTradesOpened++;
+
+   PrintFormat(">> [YENI ISLEM]: #%I64u %s | Giris: %.5f | Lot: %.2f | Mum: %s | TP hedefi: %d lehine mum, SL hedefi: %d aleyhine mum",
+               positionId, (isBuy ? "BUY" : "SELL"), entryPrice, lot,
+               TimeToString(signalBarTime, TIME_DATE | TIME_MINUTES),
+               InpTPCandleCount, InpSLCandleCount);
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| KAPALI POZISYONU PIYASADAN KAPAT                                 |
+//+------------------------------------------------------------------+
+bool CloseTicket(ulong ticket)
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
-   
-   double tpDist = currentEffectiveStepPrice;
-   double safetySLDist = InpUseSafetySL ? (currentEffectiveStepPrice * InpSafetySLMultiplier) : 0;
-   
-   // Buy Parametreleri (TP: 1 Kademe Yukari)
-   double buyTP = ask + tpDist;
-   double buySL = (safetySLDist > 0) ? (ask - safetySLDist) : 0;
-   
-   // Sell Parametreleri (TP: 1 Kademe Asagi)
-   double sellTP = bid - tpDist;
-   double sellSL = (safetySLDist > 0) ? (bid + safetySLDist) : 0;
-   
-   double lot = NormalizeLot(InpBaseLot);
-   
-   bool buyOk  = trade.Buy(lot, _Symbol, ask, buySL, buyTP, StringFormat("PAIR_B_%.5f", levelPrice));
-   ulong bTicket = buyOk ? trade.ResultOrder() : 0;
-   
-   bool sellOk = trade.Sell(lot, _Symbol, bid, sellSL, sellTP, StringFormat("PAIR_S_%.5f", levelPrice));
-   ulong sTicket = sellOk ? trade.ResultOrder() : 0;
-   
-   if(bTicket > 0 && sTicket > 0)
-   {
-      int sz = ArraySize(pairsTable);
-      ArrayResize(pairsTable, sz + 1);
-      pairsTable[sz].buyTicket      = bTicket;
-      pairsTable[sz].sellTicket     = sTicket;
-      pairsTable[sz].levelPrice     = levelPrice;
-      pairsTable[sz].buyClosedTP    = false;
-      pairsTable[sz].sellClosedTP   = false;
-      pairsTable[sz].breakevenArmed = false;
-      pairsTable[sz].isCompleted    = false;
-      pairsTable[sz].openTime       = TimeCurrent();
-      
-      totalPairsCreated++;
-      PrintFormat(">> [YENI KADEME ACILDI]: Seviye: %.5f | Buy: #%I64u | Sell: #%I64u", levelPrice, bTicket, sTicket);
-      return true;
-   }
-   return false;
+   return trade.PositionClose(ticket);
 }
 
 //+------------------------------------------------------------------+
-//| BIRI TP OLUNCA DIGERININ STOPUNU SIFIRA CEKME MOTORU             |
+//| KAPANAN TEK BIR MUMU ACIK ISLEMLERIN SAYACLARINA ISLE            |
+//| Lehine mum  -> tpCount++   (BUY icin YUKARI, SELL icin ASAGI)    |
+//| Aleyhine mum-> slCount++                                          |
+//| Sayac ARDISIKLIK ARAMAZ; birikerek ilerler.                      |
 //+------------------------------------------------------------------+
-void ProcessPairedBreakevenLogic(double ask, double bid)
+void ApplyClosedCandleToCounters(datetime closedBarTime, int dir)
 {
-   int count = ArraySize(pairsTable);
-   if(count == 0) return;
-   
-   double buffer = PipsToPrice(InpBreakevenBufferPips);
-   
-   for(int i = 0; i < count; i++)
+   if(dir == 0) return;                        // Doji: hicbir sayaci ilerletmez, islem de acmaz
+
+   for(int i = 0; i < ArraySize(tradesTable); i++)
    {
-      if(pairsTable[i].isCompleted) continue;
-      
-      bool buyIsOpen  = posInfo.SelectByTicket(pairsTable[i].buyTicket);
-      bool sellIsOpen = posInfo.SelectByTicket(pairsTable[i].sellTicket);
-      
-      // Iki bacak da kapandiysa bu cift tamamlanmistir
-      if(!buyIsOpen && !sellIsOpen)
+      if(tradesTable[i].isClosed) continue;
+
+      ulong ticket = tradesTable[i].ticket;
+      if(!posInfo.SelectByTicket(ticket))
       {
-         pairsTable[i].isCompleted = true;
+         tradesTable[i].isClosed = true;         // Harici kapatilmis (emniyet stop vb.)
          continue;
       }
-      
-      // 1. DURUM: BUY TP OLDU VE KAPANDI (FIYAT YUKARI GITTI)
-      if(!buyIsOpen && !pairsTable[i].buyClosedTP && sellIsOpen)
-      {
-         pairsTable[i].buyClosedTP = true;
-         pairsTable[i].breakevenArmed = true;
-         totalTPHits++;
-         PrintFormat(">> [KARA GECEN TP OLDU]: #%I64u Buy TP aldi! Eslesmis #%I64u Sell artik SIFIR NOKTASINA (%.5f) kilitlendi.",
-                     pairsTable[i].buyTicket, pairsTable[i].sellTicket, pairsTable[i].levelPrice);
-      }
-      
-      // 2. DURUM: SELL TP OLDU VE KAPANDI (FIYAT ASAGI GITTI)
-      if(!sellIsOpen && !pairsTable[i].sellClosedTP && buyIsOpen)
-      {
-         pairsTable[i].sellClosedTP = true;
-         pairsTable[i].breakevenArmed = true;
-         totalTPHits++;
-         PrintFormat(">> [KARA GECEN TP OLDU]: #%I64u Sell TP aldi! Eslesmis #%I64u Buy artik SIFIR NOKTASINA (%.5f) kilitlendi.",
-                     pairsTable[i].sellTicket, pairsTable[i].buyTicket, pairsTable[i].levelPrice);
-      }
-      
-      // 3. SIFIR NOKTASI (BREAKEVEN) CIKIS KONTROLU
-      if(pairsTable[i].breakevenArmed)
-      {
-         // A) Buy TP olmustu, Sell acik bekliyor:
-         // Fiyat baslangic seviyesine geri dustugunde Sell sifir zararla kapansin!
-         if(pairsTable[i].buyClosedTP && sellIsOpen)
-         {
-            if(posInfo.SelectByTicket(pairsTable[i].sellTicket))
-            {
-               double entryP = pairsTable[i].levelPrice;
-               if(ask <= entryP + buffer)
-               {
-                  trade.SetExpertMagicNumber(InpMagicNumber);
-                  if(trade.PositionClose(pairsTable[i].sellTicket))
-                  {
-                     totalBreakevenCloses++;
-                     pairsTable[i].isCompleted = true;
-                     PrintFormat(">>>>> [SIFIR NOKTASINDA KAPANDI]: #%I64u Sell baslangic fiyati olan %.5f seviyesinde SIFIRLA kapatildi! (Buy kari cepte kaldi)",
-                                 pairsTable[i].sellTicket, ask);
-                  }
-               }
-            }
-         }
-         
-         // B) Sell TP olmustu, Buy acik bekliyor:
-         // Fiyat baslangic seviyesine geri ciktiginda Buy sifir zararla kapansin!
-         if(pairsTable[i].sellClosedTP && buyIsOpen)
-         {
-            if(posInfo.SelectByTicket(pairsTable[i].buyTicket))
-            {
-               double entryP = pairsTable[i].levelPrice;
-               if(bid >= entryP - buffer)
-               {
-                  trade.SetExpertMagicNumber(InpMagicNumber);
-                  if(trade.PositionClose(pairsTable[i].buyTicket))
-                  {
-                     totalBreakevenCloses++;
-                     pairsTable[i].isCompleted = true;
-                     PrintFormat(">>>>> [SIFIR NOKTASINDA KAPANDI]: #%I64u Buy baslangic fiyati olan %.5f seviyesinde SIFIRLA kapatildi! (Sell kari cepte kaldi)",
-                                 pairsTable[i].buyTicket, bid);
-                  }
-               }
-            }
-         }
-      }
+
+      // Bu islem icin bu mum daha once sayildiysa atla (cift sayma olmasin)
+      if(tradesTable[i].lastCountedBarTime >= closedBarTime) continue;
+
+      bool inFavor = (tradesTable[i].isBuy && dir ==  1) ||
+                     (!tradesTable[i].isBuy && dir == -1);
+      if(inFavor) tradesTable[i].tpCount++;
+      else        tradesTable[i].slCount++;
+
+      tradesTable[i].lastCountedBarTime = closedBarTime;
+
+      // Esige ulasildiysa kapat (TP: 3 lehine mum / SL: 10 aleyhine mum)
+      TryCloseByCandleCounts(i, closedBarTime);
    }
 }
 
 //+------------------------------------------------------------------+
-//| SONRAKI KADEMEDE YINE 1 BUY + 1 SELL ACAN GRID MOTORU            |
+//| ANA MOTOR: SON ISLEMDEN BU YANA KAPANAN TUM MUMLARI ISLE         |
+//| Normal akista tek mum kapanir; hafta sonu/bosluk gibi durumlarda |
+//| aradaki TUM kapanmis mumlar sirayla sayilir (sayac kaybi olmaz). |
+//| Yeni islem ise sadece EN SON kapanan mumun yonunde acilir.       |
 //+------------------------------------------------------------------+
-void ManagePerpetualPairedGrid(double ask, double bid)
+void ProcessClosedCandles()
 {
-   int activePairsCount = 0;
-   int totalActivePairs = ArraySize(pairsTable);
-   
-   for(int i = 0; i < totalActivePairs; i++)
+   int prevShift = iBarShift(_Symbol, _Period, lastBarProcessed);
+   if(prevShift < 1) prevShift = 1;
+
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int copied = CopyRates(_Symbol, _Period, 1, prevShift, r);
+   if(copied < 1) return;
+
+   if(copied > 1)
+      PrintFormat(">> [BILGI]: %d adet kapanmis mum birikmis, hepsi sirayla sayiliyor.", copied);
+
+   // Kronolojik sira: en eski kapanan mumdan (en yuksek shift) en yeniye dogru
+   for(int i = copied - 1; i >= 0; i--)
    {
-      if(!pairsTable[i].isCompleted)
-         activePairsCount++;
-   }
-   
-   // 1. ILK BASLANGIC: HIC ISLEM YOKSA MERKEZDE 1 BUY + 1 SELL AC
-   if(activePairsCount == 0)
-   {
-      // Varlık döngü başlangıcını kaydet
-      cycleStartEquity = accountInfo.Equity();
-      targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
-      
-      double mid = (ask + bid) / 2.0;
-      OpenPairedLevel(ask, bid, mid);
-      return;
-   }
-   
-   if(activePairsCount >= InpMaxOpenPairs) return;
-   
-   // 2. EN YAKIN KADEME MESAFESINI BUL
-   // Fiyat en yakin aktif kademeden 1 grid adimi (5 pip) uzaklasmissa yeni kademe ac!
-   double currentMid = (ask + bid) / 2.0;
-   double minDistance = 999999.0;
-   
-   for(int i = 0; i < totalActivePairs; i++)
-   {
-      if(!pairsTable[i].isCompleted)
+      datetime barTime = r[i].time;
+      int dir = 0;
+      if(r[i].close > r[i].open)      dir =  1;
+      else if(r[i].close < r[i].open) dir = -1;
+
+      ApplyClosedCandleToCounters(barTime, dir);
+
+      // Yeni islem sadece EN SON kapanan mum icin (i == 0)
+      if(i == 0)
       {
-         double dist = MathAbs(currentMid - pairsTable[i].levelPrice);
-         if(dist < minDistance)
-            minDistance = dist;
+         lastCandleProcessed = barTime;
+         if(dir == 0)
+         {
+            PrintFormat(">> [MUM KAPANDI]: %s -> DOJI (acilis=kapanis), yon sinyali yok, yeni islem acilmadi.",
+                        TimeToString(barTime, TIME_DATE | TIME_MINUTES));
+         }
+         else
+         {
+            // Mum YUKARI kapandi -> BUY | Mum ASAGI kapandi -> SELL
+            OpenCandleTrade((dir == 1), barTime);
+         }
       }
-   }
-   
-   if(minDistance >= currentEffectiveStepPrice * 0.95)
-   {
-      OpenPairedLevel(ask, bid, currentMid);
-      PrintFormat(">> [SONRAKI GRIDDE YINE 1 BUY + 1 SELL ACILDI]: Yeni Seviye: %.5f | Aktif Cift Sayisi: %d",
-                  currentMid, activePairsCount + 1);
    }
 }
 
@@ -414,78 +486,66 @@ void ManagePerpetualPairedGrid(double ask, double bid)
 void CheckBasketTPAndProtection()
 {
    double totalBasketPnL = 0.0;
-   int openCount = 0;
-   
+   int    openCount = 0;
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
       {
          openCount++;
          totalBasketPnL += (posInfo.Profit() + posInfo.Swap() + posInfo.Commission());
       }
    }
-   
-   if(openCount == 0) return;
-   
+
    double currentEquity = accountInfo.Equity();
+
+   if(cycleStartEquity <= 0)
+   {
+      cycleStartEquity  = currentEquity;
+      targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
+   }
+
+   if(openCount == 0) return;
+
    bool targetReached = false;
-   
-   // 1. MOD: NET VARLIK (EQUITY) HEDEFI (Orn: 100 USD -> 102 USD)
+
    if(InpUseBasketTP)
    {
       if(InpBasketTPMode == BASKET_TP_EQUITY_GROWTH)
       {
-         if(cycleStartEquity <= 0)
-         {
-            cycleStartEquity = currentEquity;
-            targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
-         }
-         
-         // Varlık hedefe ulaştı mı? (Örn: 102 USD)
-         if(currentEquity >= targetCycleEquity)
-         {
-            targetReached = true;
-         }
+         if(currentEquity >= targetCycleEquity) targetReached = true;
       }
-      // 2. MOD: YUZEN ANLIK KAR HEDEFI (Floating PnL >= InpTargetProfitUSD)
       else if(InpBasketTPMode == BASKET_TP_FLOATING_PNL)
       {
-         if(totalBasketPnL >= InpTargetProfitUSD)
-         {
-            targetReached = true;
-         }
+         if(totalBasketPnL >= InpTargetProfitUSD) targetReached = true;
       }
    }
-   
-   // HEDEF GERCEKLESTIGINDE: TUM POZISYONLARI KAPAT VE SIFIRDAN BASLA!
+
    if(targetReached)
    {
       CloseAllPositions();
-      ArrayResize(pairsTable, 0);
-      totalClosedCycles++;
-      
-      // Yeni döngünün başlangıç varlığını hemen güncelle
-      cycleStartEquity = accountInfo.Equity();
+      ArrayResize(tradesTable, 0);
+      totalBasketCloses++;
+
+      cycleStartEquity  = accountInfo.Equity();
       targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
-      
-      PrintFormat(">>>>> [HEDEF VARLIGA ULASTI!]: Net Varlık %.2f USD oldu! Tum pozisyonlar kapatildi, yeni hedef: %.2f USD",
+
+      PrintFormat(">>>>> [HEDEF VARLIGA ULASTI!]: Net Varlik %.2f USD oldu! Tum pozisyonlar kapatildi, yeni hedef: %.2f USD",
                   cycleStartEquity, targetCycleEquity);
       return;
    }
-   
-   // Maksimum Drawdown Emniyeti
+
    if(InpUseEquityProtection)
    {
-      double equity  = accountInfo.Equity();
       double balance = accountInfo.Balance();
       if(balance > 0)
       {
-         double dd = ((balance - equity) / balance) * 100.0;
+         double dd = ((balance - currentEquity) / balance) * 100.0;
          if(dd >= InpMaxDrawdownPercent)
          {
             CloseAllPositions();
-            ArrayResize(pairsTable, 0);
-            cycleStartEquity = accountInfo.Equity();
+            ArrayResize(tradesTable, 0);
+            cycleStartEquity  = accountInfo.Equity();
             targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
             PrintFormat("!!!!! [RISK KORUMASI]: Drawdown (%%%.2f) asildi! Sepet guvenlik icin kapatildi.", dd);
             return;
@@ -498,10 +558,8 @@ void CloseAllPositions()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
-      {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
          trade.PositionClose(posInfo.Ticket());
-      }
    }
 }
 
@@ -510,58 +568,79 @@ void CloseAllPositions()
 //+------------------------------------------------------------------+
 void UpdateHUD()
 {
-   int buyPositions = 0, sellPositions = 0;
+   int    buyPositions = 0, sellPositions = 0;
    double floatingPnL = 0.0;
-   
+
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == InpMagicNumber)
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == (long)InpMagicNumber)
       {
          if(posInfo.PositionType() == POSITION_TYPE_BUY) buyPositions++;
-         if(posInfo.PositionType() == POSITION_TYPE_SELL) sellPositions++;
+         else                                           sellPositions++;
          floatingPnL += (posInfo.Profit() + posInfo.Swap() + posInfo.Commission());
       }
    }
-   
-   int activePairs = 0;
-   for(int i = 0; i < ArraySize(pairsTable); i++)
-   {
-      if(!pairsTable[i].isCompleted) activePairs++;
-   }
-   
+
    double currentEquity = accountInfo.Equity();
    double remainingToTarget = targetCycleEquity - currentEquity;
    if(remainingToTarget < 0) remainingToTarget = 0.0;
-   
+
    string tpModeStr = (InpBasketTPMode == BASKET_TP_EQUITY_GROWTH) ? "NET VARLIK (EQUITY) ARTISI" : "ANLIK YUZEN KAR (FLOATING)";
-   
+
    string text = StringFormat(
       "==========================================================\n"
-      "      HEDGE GRID PRO EA v9.0 - NET VARLIK HEDEFI MODU     \n"
+      "   MUM MODLU HEDGE v10.0 - MUM SAYACI TP/SL (GRID YOK)    \n"
       "==========================================================\n"
-      "Sepet Kar Hesap Modu    : %s\n"
-      "Dongu Baslangic Varligi : %.2f USD\n"
-      "Mevcut Net Varlik       : %.2f USD\n"
-      "Hedef Net Varlik        : %.2f USD (+%.2f USD)\n"
-      "Hedefe Kalan            : %.2f USD\n"
+      "Giris Kurali : Her mum kapanisi -> YUKARI=BUY / ASAGI=SELL\n"
+      "TP Kurali    : Giris sonrasi %d adet LEHINE mum kapanisi\n"
+      "SL Kurali    : Giris sonrasi %d adet ALEYHINE mum kapanisi\n"
+      "Son Mum      : %s\n"
       "----------------------------------------------------------\n"
-      "Aktif Acik Buy / Sell   : %d Buy / %d Sell (Aktif Cift: %d)\n"
-      "TP Alip Kapanan Islemler: %d Kez Kazandi\n"
-      "Sifir Noktasinda Cikanlar: %d Kez Zararsiz Temizlendi\n"
-      "Sepet Anlik Floating PnL : %.2f USD\n"
-      "Tamamlanan Basarili Tur : %d Tur Sifirlandi ve Yenilendi\n"
-      "==========================================================",
-      tpModeStr,
+      "Acik Buy / Sell      : %d / %d  (Toplam: %d)\n"
+      "Sepet Floating PnL   : %.2f USD\n"
+      "Dongu Baslangic Varlik: %.2f USD\n"
+      "Mevcut Net Varlik    : %.2f USD\n"
+      "Hedef Net Varlik (%s) : %.2f USD | Kalan: %.2f USD\n"
+      "----------------------------------------------------------\n"
+      "Acilan Islem         : %d\n"
+      "Mum TP ile Kapanan   : %d\n"
+      "Mum SL ile Kapanan   : %d\n"
+      "Sepet Sifirlama      : %d tur\n"
+      "Kumulatif Realized   : %.2f USD\n"
+      "==========================================================\n",
+      InpTPCandleCount,
+      InpSLCandleCount,
+      TimeToString(lastCandleProcessed, TIME_DATE | TIME_MINUTES),
+      buyPositions, sellPositions, buyPositions + sellPositions,
+      floatingPnL,
       cycleStartEquity,
       currentEquity,
-      targetCycleEquity, InpTargetProfitUSD,
-      remainingToTarget,
-      buyPositions, sellPositions, activePairs,
-      totalTPHits,
-      totalBreakevenCloses,
-      floatingPnL,
-      totalClosedCycles
+      tpModeStr, targetCycleEquity, remainingToTarget,
+      totalTradesOpened,
+      totalTPCloses,
+      totalSLCloses,
+      totalBasketCloses,
+      totalRealizedProfitUSD
    );
+
+   // Acik islemlerin mum sayaclari (en yeni olanlar ustte)
+   text += "ACIK ISLEMLERIN MUM SAYACLARI (TP: " + IntegerToString(InpTPCandleCount) +
+           " lehine / SL: " + IntegerToString(InpSLCandleCount) + " aleyhine)\n";
+
+   int shown = 0;
+   for(int i = ArraySize(tradesTable) - 1; i >= 0 && shown < InpHudMaxRows; i--)
+   {
+      if(tradesTable[i].isClosed) continue;
+      text += StringFormat("#%I64u %s | Giris: %.5f | Lehine: %d/%d | Aleyhine: %d/%d\n",
+                           tradesTable[i].ticket,
+                           (tradesTable[i].isBuy ? "BUY " : "SELL"),
+                           tradesTable[i].entryPrice,
+                           tradesTable[i].tpCount, InpTPCandleCount,
+                           tradesTable[i].slCount, InpSLCandleCount);
+      shown++;
+   }
+   if(shown == 0) text += "(su an acik islem yok)\n";
+
    Comment(text);
 }
 
@@ -572,31 +651,30 @@ int OnInit()
 {
    InitPipFactor();
    trade.SetDeviationInPoints(InpSlippagePoints);
-   
-   if(InpSpacingMode == SPACING_AUTO_ATR)
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   if(InpTPCandleCount <= 0 && InpSLCandleCount <= 0)
    {
-      atrHandle = iATR(_Symbol, _Period, InpATRPeriod);
-      if(atrHandle == INVALID_HANDLE)
-      {
-         Print("Hata: ATR Gostergesi baslatilamadi!");
-         return INIT_FAILED;
-      }
+      Print("!! [HATA]: TP ve SL mum sayisi ayni anda 0 olamaz. En az biri pozitif olmali.");
+      return INIT_PARAMETERS_INCORRECT;
    }
-   
-   UpdateGridSpacing();
-   
-   // Başlangıç Net Varlığını Kaydet
-   cycleStartEquity = accountInfo.Equity();
+
+   ArrayResize(tradesTable, 0);
+
+   // Ilk tick'te yanlis sinyal uretmemek icin mevcut mumu islenmis say
+   lastBarProcessed  = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
+   lastCandleProcessed = 0;
+
+   cycleStartEquity  = accountInfo.Equity();
    targetCycleEquity = cycleStartEquity + InpTargetProfitUSD;
-   
-   PrintFormat(">> [HEDGE GRID PRO EA v9.0] Basariyla Baslatildi. Baslangic Varligi: %.2f USD | Hedef Varlik: %.2f USD",
-               cycleStartEquity, targetCycleEquity);
+
+   PrintFormat(">> [MUM MODLU HEDGE v10.0] Baslatildi | Sembol: %s | Periyot: %s | TP: %d lehine mum | SL: %d aleyhine mum | Baslangic Varlik: %.2f USD",
+               _Symbol, EnumToString(_Period), InpTPCandleCount, InpSLCandleCount, cycleStartEquity);
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
    Comment("");
 }
 
@@ -605,26 +683,30 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(ask <= 0 || bid <= 0) return;
-   
+
+   // Acik pozisyonlarla tabloyu esitle (harici kapananlar / yeniden baslatma)
+   SyncTradesTable();
+
+   // Yeni mum acildiysa = bir onceki mum KAPANDI
    datetime currentBarTime = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
-   if(currentBarTime != lastBarProcessed)
+   if(currentBarTime > 0 && currentBarTime != lastBarProcessed)
    {
-      UpdateGridSpacing();
-      lastBarProcessed = currentBarTime;
+      if(lastBarProcessed == 0)
+      {
+         // Grafige yeni baglandi: mevcut mumu baz al, geriye donuk sinyal uretme
+         lastBarProcessed = currentBarTime;
+      }
+      else
+      {
+         lastBarProcessed = currentBarTime;
+         SyncRealizedProfits();
+         ProcessClosedCandles();
+      }
    }
-   
-   SyncRealizedProfits();
-   
-   // 1. ADIM: Kara geceni TP yap, kalan bacak sifir noktasina gelince zararsiz kapa
-   ProcessPairedBreakevenLogic(ask, bid);
-   
-   // 2. ADIM: Sonraki grid kademesine ulasildiysa yine 1 Buy + 1 Sell ac
-   ManagePerpetualPairedGrid(ask, bid);
-   
-   // 3. ADIM: Net Varlık (Equity) hedefe (ör. 102 USD) ulaştıysa hepsini kapat ve sıfırdan başla!
+
+   // Sepet kar hedefi / drawdown korumasi
    CheckBasketTPAndProtection();
-   
-   // 4. ADIM: Bilgi panelini guncelle
-   UpdateHUD();
+
+   if(InpShowHUD) UpdateHUD();
 }
 //+------------------------------------------------------------------+
